@@ -1,0 +1,736 @@
+---
+title: "Classifiers NEW"
+author: "Ani Khachatryan"
+date: "4/24/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir='E:/Columbia/Spring2020/lab/data/')
+```
+
+Global options
+```{r}
+BALANCED_TEST <- TRUE
+# TRUE because FALSE leads to horrible performance
+BALANCED_TRAIN <- TRUE
+ORGAN_SPECIFIC <- TRUE
+CONVERT_TO_RANK_PERC <- TRUE
+CROSS_VALIDATE <- TRUE
+k <- 3
+```
+
+Imports
+```{r}
+# LASSO
+library(glmnet)
+library(tidyverse)
+library(dplyr)
+
+# Random Forest
+library(randomForest)
+require(caTools)
+
+# Gradient Boosting
+require(gbm)
+
+# cross-validation
+library(caret)
+
+# roc curves
+library(pROC)
+```
+
+
+Load the risk genes.
+```{r}
+DDD_all <- read.csv('./DDD/DDG2P_28_1_2020.csv')
+
+DDD_all$organ.specificity.list <- tolower(DDD_all$organ.specificity.list)
+DDD_all$gene.symbol <- tolower(DDD_all$gene.symbol)
+
+DDD <- subset(DDD_all, DDD.category == 'confirmed')
+```
+
+Create a T/F table of genes vs RBPs, TRUE if RBP regulates the gene
+rbp_threshold is the number of binding sites/events (?) necessary to consider the RBP a regulator of the protein
+
+```{r}
+# RBP-regualted genes
+rbp_table <- read.table('./RBP_targets/RBP_targets.txt', header=TRUE, row.names = 1)
+colnames(rbp_table) <- tolower(colnames(rbp_table))
+rownames(rbp_table) <- tolower(rownames(rbp_table))
+rbps_w_celltypes <- colnames(rbp_table)
+
+sfun <- function(MyString) {
+  return(strsplit(MyString, '.', TRUE)[[1]][2])
+}
+
+rbps <- sapply(rbps_w_celltypes, sfun)
+#rbps <- tolower(sapply(rbps_w_celltypes, sfun))
+colnames(rbp_table) <- rbps
+
+# needs to have at least rbp_threshold binding sites 
+rbp_threshold <- 10
+rbp_table_tf <- rbp_table >= rbp_threshold
+```
+
+Helper function: removes the extension from the cell type
+```{r}
+remove_ext <- function(mystr) {
+    return(tools::file_path_sans_ext(mystr))
+  }
+```
+
+Helper function: replaces spaces in a string with underscores
+```{r}
+replace_space <- function(mystr) {
+  return(gsub(' ', '_', mystr, fixed = TRUE))
+}
+```
+
+Helper function: adds axtension
+```{r}
+add_ext <- function(mystr, myext) {
+    return(paste0(mystr, '.', myext))
+  }
+```
+
+Helper function: takes a vector of values and converts them to rank percentile
+```{r}
+rank_percentile <- function(mydata) {
+  mydata.rank <- rank(mydata, ties.method="min")
+  mydata.rank.perc <- round(mydata.rank/length(mydata.rank), 4)
+  
+  return(mydata.rank.perc)
+}
+```
+
+A function that takes the data as a data.frame and returns a data frame that can be used as an input to the classifier
+gene_label is the label - risk/non-risk
+```{r}
+make_classifier_df <- function(data_df, organ=NULL, convert_to_rank_perc=FALSE, expr_only=FALSE) {
+  risk_genes <- DDD$gene.symbol
+  if (!is.null(organ)) {
+    risk_genes <- unique(DDD[grep(organ, DDD$organ.specificity.list, ignore.case = TRUE),]$gene.symbol)
+  }
+  
+  rownames(data_df) <- tolower(rownames(data_df))
+  colnames(data_df) <- unlist(lapply(colnames(data_df), replace_space))
+  colnames(data_df) <- unlist(lapply(colnames(data_df), remove_ext))
+  colnames(data_df) <- unlist(lapply(colnames(data_df), add_ext, myext='ct'))
+
+
+  # only keep genes for which we have both rbp and expression data
+  data_df <- data_df[rownames(data_df) %in% rownames(rbp_table_tf),]
+  
+  if (!expr_only) {
+    rbp_table_tf_cur <- rbp_table_tf[rownames(rbp_table_tf) %in% rownames(data_df),]
+    # make colnames unique 
+    colnames(rbp_table_tf_cur) <- make.unique(colnames(rbp_table_tf_cur))
+    # label genes risk or non-risk, remove possible risk genes
+    rbp_table_tf_cur <- rbp_table_tf_cur[((rownames(rbp_table_tf_cur) %in% risk_genes) + (rownames(rbp_table_tf_cur) %in% DDD_all$gene.symbol) != 1),]
+    colnames(rbp_table_tf_cur) <- unlist(lapply(colnames(rbp_table_tf_cur), add_ext, myext='rbp'))
+  }
+
+  data_df <- data_df[((rownames(data_df) %in% risk_genes) + (rownames(data_df) %in% DDD_all$gene.symbol) != 1),]
+  
+  # label
+  gene_label <- rownames(data_df) %in% risk_genes
+  gene_label <- ifelse(gene_label, 1, 0)
+
+  # aggregate expression by celltype
+  # same as data_df but transposed, genes are columns and samples are rows now
+  data_df_t <- t(data_df)
+  
+  # genes are columns and rows are aggregate samples
+  data_df_t_agg <- aggregate.data.frame(x = data_df_t, by = list(row.names(data_df_t)), FUN = mean)
+  rownames(data_df_t_agg) <- data_df_t_agg$Group.1
+  data_df_agg <- t(data_df_t_agg[,-1])
+  
+  # convert expression values to rank percentile
+  if (convert_to_rank_perc) {
+    data_df_agg <- apply(X=data_df_agg, MARGIN = 2, FUN = rank_percentile)
+  }
+  if (!expr_only) {
+  # cbind rbp and expression data
+    classifier_df <- cbind(rbp_table_tf_cur, data_df_agg)
+  } else {
+    classifier_df <- data_df_agg
+  }
+  classifier_df <- cbind(classifier_df, gene_label)
+
+  return(as.data.frame(classifier_df))
+}
+```
+
+Takes the input data and splits it into training and testing sets
+```{r}
+create_train_test_data <- function(inputData, balanced_test=FALSE, balanced_train=FALSE, train_proportion=.7) {
+  # Create Training Data
+  input_ones <- inputData[which(inputData$gene_label == 1), ]  # all 1's
+  input_zeros <- inputData[which(inputData$gene_label == 0), ]  # all 0's
+  input_ones_training_rows <- sample(1:nrow(input_ones), train_proportion*nrow(input_ones))  # 1's for training
+  if (balanced_train) {
+    # 0's for training. Pick as many 0's as 1's
+    input_zeros_training_rows <- sample(1:nrow(input_zeros), train_proportion*nrow(input_ones)) 
+  } else {
+    # pick more 0s than ones, proportionally to the data
+    input_zeros_training_rows <- sample(1:nrow(input_zeros), train_proportion*nrow(input_zeros))
+  }
+
+  training_ones <- input_ones[input_ones_training_rows, ]  
+  training_zeros <- input_zeros[input_zeros_training_rows, ]
+  trainingData <- rbind(training_ones, training_zeros)  # row bind the 1's and 0's 
+  
+  # Create Test Data
+  test_ones <- input_ones[-input_ones_training_rows, ]
+  test_zeros <- input_zeros[-input_zeros_training_rows, ]
+  if (balanced_test) {
+    test_zeros <- sample_n(test_zeros, dim(test_ones)[1])
+  }
+  
+  testData <- rbind(test_ones, test_zeros)  # row bind the 1's and 0's 
+  
+  return(list(trainingData, testData))
+}
+```
+
+**Logistic Regression**
+```{r warning=FALSE}
+do_logistic <- function(trainingData, testData, pval_threshold = .1, return_probs=FALSE, cv=CROSS_VALIDATE, k=3) {
+  if (cv) {
+    X <- rbind(trainingData[, -which(names(trainingData) == "gene_label")],  testData[, -which(names(testData) == "gene_label")])
+    Y <- as.factor(c(trainingData$gene_label, testData$gene_label))
+    train.control <- trainControl(method = "cv", number=k)
+    model.fit.cv <- train(X, Y, method = "glm", family="binomial", trControl = train.control)
+    
+    # Accuracy
+    return(model.fit.cv$results[['Accuracy']])
+  }
+  
+  # Fit the model
+  glm.fit <- glm(formula =  gene_label ~ ., family = binomial, data = trainingData)
+
+  # predict on test set
+  glm.probs <- predict(glm.fit,
+                    newdata = testData,
+                    type = "response")
+
+  glm.pred <- ifelse(glm.probs > 0.5, 1, 0)
+
+  accuracy <- mean(glm.pred == testData$gene_label)
+  print(paste('accuracy:', round(accuracy, 4)))
+  
+  if (return_probs) {
+    return(list(glm.probs, glm.fit, accuracy))
+  }
+  return(accuracy)
+}
+```
+
+**LASSO**
+```{r}
+do_lasso <- function(trainingData, testData, return_probs=FALSE, cv=CROSS_VALIDATE, k=3) {
+  if (cv) {
+    # find the optimal number for lambda
+    x.train <- model.matrix(gene_label~., trainingData)[,-1]
+    y.train <- trainingData['gene_label'][[1]]
+  
+    # Find the best lambda using cross-validation
+    cv.lasso <- cv.glmnet(x.train, y.train, alpha = 1, family = "binomial")
+    lambda <- cv.lasso$lambda.min
+    
+    X <- rbind(trainingData[, -which(names(trainingData) == "gene_label")],  testData[, -which(names(testData) == "gene_label")])
+    Y <- as.factor(c(trainingData$gene_label, testData$gene_label))
+    train.control <- trainControl(method = "cv", number=k)
+    
+    model.fit.cv <- train(X, Y, method = "glmnet", trControl = train.control, family = 'binomial', tuneGrid = expand.grid(alpha = 1, lambda = lambda))
+    
+    # Accuracy
+    return(model.fit.cv$results[['Accuracy']])
+  }
+
+  x.train <- model.matrix(gene_label~., trainingData)[,-1]
+  y.train <- trainingData['gene_label'][[1]]
+  
+  # Find the best lambda using cross-validation
+  cv.lasso <- cv.glmnet(x.train, y.train, alpha = 1, family = "binomial")
+  print(paste('cv lambda:', cv.lasso$lambda.min))
+  
+  # Fit the final model on the training data
+  model <- glmnet(x.train, y.train, alpha = 1, family = "binomial",
+                  lambda = cv.lasso$lambda.min)
+  
+  # Display regression coefficients
+  # coef(model)
+  
+  # Make predictions on the test data
+  x.test <- model.matrix(gene_label ~., testData)[,-1]
+  probabilities <- model %>% predict(newx = x.test)
+  predicted.classes <- ifelse(probabilities > 0.5, 1, 0)
+  
+  # Model accuracy
+  observed.classes <- testData$gene_label
+  accuracy <- mean(predicted.classes == observed.classes)
+  print(paste('accuracy:', accuracy))
+  if (return_probs) {
+    return(list(probabilities, model, accuracy))
+  }
+  return(accuracy)
+}
+```
+
+**Random Forest**
+```{r}
+do_rf <- function(trainingData, testData, return_probs=FALSE, cv=CROSS_VALIDATE, k=3) {
+  if (cv) {
+    X <- rbind(trainingData[, -which(names(trainingData) == "gene_label")],  testData[, -which(names(testData) == "gene_label")])
+    Y <- as.factor(c(trainingData$gene_label, testData$gene_label))
+    train.control <- trainControl(method = "cv", number=k)
+    tunegrid <- expand.grid(.mtry=sqrt(ncol(X)))
+    
+    model.fit.cv <- train(X, Y, method = "rf", metric='Accuracy', trControl = train.control, tuneGrid = tunegrid)
+    
+    # Accuracy
+    return(model.fit.cv$results[['Accuracy']])
+  }
+  
+  # trainingData <- transform(trainingData, gene_label=as.factor(gene_label))
+  trainingData$gene_label <- as.factor(trainingData$gene_label)
+  
+  x.train <- model.matrix(gene_label~., trainingData)[,-1]
+  y.train <- trainingData['gene_label'][[1]]
+  
+  x.test <- model.matrix(gene_label~., testData)[,-1]
+  y.test <- testData['gene_label'][[1]]
+
+  rf <- randomForest(
+    x = x.train,
+    y = as.factor(y.train)) #,
+    # ntree = 1000)
+    #mtry = 25)
+  
+  # predict on test
+  # pred <- predict(rf, newdata=testData[-(dim(testData)[2])])
+  prob <- predict(rf, x.test, type="prob")[, 2]
+  pred <- ifelse(prob > .5, 1, 0)
+  
+  # test accuracy
+  accuracy <- mean(pred == testData$gene_label)
+  
+  print(paste('accuracy:', accuracy))
+  
+  if (return_probs) {
+    return(list(prob, rf, accuracy))
+  }
+  return(accuracy)
+}
+
+```
+
+
+**Gradient Boosting**
+```{r warning=FALSE}
+do_gb <- function(trainingData, testData, return_probs=FALSE, cv=CROSS_VALIDATE, k=3) {
+  if (cv) {
+    gb <- gbm(
+    formula = gene_label ~ .,
+    distribution = 'bernoulli',
+    data = trainingData,
+    n.trees = 100, 
+    cv.folds = 5)
+    
+    ntree_opt_cv <- gbm.perf(gb, method = 'cv')
+    print(paste('optimal number of trees (cv);', ntree_opt_cv))
+    
+    X <- rbind(trainingData[, -which(names(trainingData) == "gene_label")],  testData[, -which(names(testData) == "gene_label")])
+    Y <- as.factor(c(trainingData$gene_label, testData$gene_label))
+    train.control <- trainControl(method = "cv", number=k)
+    
+    gbmGrid <-  expand.grid(n.trees = ntree_opt_cv, interaction.depth=1, shrinkage=.1, n.minobsinnode=10)
+    
+    model.fit.cv <- train(X, Y, method = "gbm", distribution = 'bernoulli', trControl = train.control, tuneGrid = gbmGrid)
+
+    # Accuracy
+    return(model.fit.cv$results[['Accuracy']])
+  }
+  
+  gb <- gbm(
+  formula = gene_label ~ .,
+  distribution = 'bernoulli',
+  data = trainingData,
+  n.trees = 100, 
+  cv.folds = 5)
+  
+  ntree_opt_cv <- gbm.perf(gb, method = 'cv')
+  print(paste('optimal number of trees (cv);', ntree_opt_cv))
+  
+  if (FALSE) {
+    gb <- gbm(
+      formula = gene_label ~ .,
+      distribution = 'bernoulli',
+      data = trainingData,
+      n.trees = ntree_opt_cv, 
+      cv.folds = 5)
+  }
+  
+  #Generating a Prediction matrix for each Tree
+  probs <-predict(
+  object = gb,
+  newdata = testData[, -dim(testData)[2]],
+  n.trees = ntree_opt_cv,
+  type = 'response')
+
+  predictions <- ifelse(probs >= .5, 1, 0)
+  accuracy <- mean(predictions == testData$gene_label)
+  
+  print(paste('accuray:', accuracy))
+  
+  if (return_probs) {
+    return(list(probs, gb, accuracy))
+  }
+  return(accuracy)
+}
+```
+
+Make inputData
+```{r}
+make_inputData <- function(data_df, organ) {
+  if (ORGAN_SPECIFIC) {
+  inputData <- make_classifier_df(data_df = data_df, organ = , organ, convert_to_rank_perc = CONVERT_TO_RANK_PERC)
+  inputData_expr_only <- make_classifier_df(data_df = data_df, organ = organ, convert_to_rank_perc = CONVERT_TO_RANK_PERC, expr_only = TRUE)
+} else {
+  inputData <- make_classifier_df(data_df = data_df, organ = NULL, convert_to_rank_perc = CONVERT_TO_RANK_PERC)
+  inputData <- make_classifier_df(data_df = data_df, organ = NULL, convert_to_rank_perc = CONVERT_TO_RANK_PERC, expr_only = TRUE)
+}
+  return(list(inputData, inputData_expr_only))
+}
+```
+
+Train classifiers
+```{r}
+train_classifiers <- function(data_df, dataset=NULL, organ='brain', return_probs=FALSE, cv=CROSS_VALIDATE) {
+  # classifier_df_cur <- data.frame(matrix(ncol=4,nrow=0, dimnames=list(NULL, c('dataset', 'classifier', 'accuracy', 'baseline_accuracy'))))
+  
+  # split into train and test
+  input <- make_inputData(data_df = data_df, organ = organ)
+  inputData <- input[[1]]
+  inputData_expr_only <- input[[2]]
+  
+  # split into train and test
+  data_train_test <- create_train_test_data(inputData, balanced_test = BALANCED_TEST, balanced_train = BALANCED_TRAIN)
+  trainingData <- data_train_test[[1]]
+  testData <- data_train_test[[2]]
+  
+  data_train_test_exp <- create_train_test_data(inputData_expr_only, balanced_test = BALANCED_TEST, balanced_train = BALANCED_TRAIN)
+  trainingData_exp <- data_train_test_exp[[1]]
+  testData_exp <- data_train_test_exp[[2]]
+
+  # fit all classifiers
+  accuracy_logistic <- do_logistic(trainingData, testData)
+  accuracy_lasso <- do_lasso(trainingData, testData)
+  accuracy_rf <- do_rf(trainingData, testData)
+  accuracy_gb <- do_gb(trainingData, testData)
+  
+  accuracy_logistic_expr_only <- do_logistic(trainingData_exp, testData_exp)
+  accuracy_lasso_expr_only <- do_lasso(trainingData_exp, testData_exp)
+  accuracy_rf_expr_only <- do_rf(trainingData_exp, testData_exp)
+  accuracy_gb_expr_only <- do_gb(trainingData_exp, testData_exp)
+
+  classifier_df <- data.frame(dataset=rep(dataset, 4), classifier=c('Logistic regression', 'LASSO regression', 'Random forest', 'Gradient boosting'), accuracy=c(accuracy_logistic, accuracy_lasso, accuracy_rf, accuracy_gb), baseline_accuracy=c(accuracy_logistic_expr_only, accuracy_lasso_expr_only, accuracy_rf_expr_only, accuracy_gb_expr_only), genes_num=rep(dim(trainingData)[1] + dim(testData)[1], 4))
+  
+  if (return_probs) {
+    # fit all classifiers
+    probs_logistic <- do_logistic(trainingData, testData, return_probs=TRUE)
+    probs_lasso <- do_lasso(trainingData, testData, return_probs=TRUE)
+    probs_rf <- do_rf(trainingData, testData, return_probs=TRUE)
+    probs_gb <- do_gb(trainingData, testData, return_probs=TRUE)
+    
+    probs_logistic_expr_only <- do_logistic(trainingData_exp, testData_exp, return_probs=TRUE)
+    probs_lasso_expr_only <- do_lasso(trainingData_exp, testData_exp, return_probs=TRUE)
+    probs_rf_expr_only <- do_rf(trainingData_exp, testData_exp, return_probs=TRUE)
+    probs_gb_expr_only <- do_gb(trainingData_exp, testData_exp, return_probs=TRUE)
+    
+    return(list(classifier_df, list(testData$gene_label, probs_logistic, probs_lasso, probs_rf, probs_gb), list(testData_exp$gene_label, probs_logistic_expr_only, probs_lasso_expr_only, probs_rf_expr_only, probs_gb_expr_only)))
+  }
+    # return classifier_df_cur
+    return(list(classifier_df))
+}
+```
+
+Create the data frame to store the results
+```{r}
+classifier_df <- data.frame(matrix(ncol=5,nrow=0, dimnames=list(NULL, c('dataset', 'classifier', 'accuracy', 'baseline_accuracy', 'genes_num')))) #, '# genes in each category (risk and non-risk)'))))
+```
+
+
+**1. Tabula Muris (FACS) data**
+
+**1.1 TM Brain (Myeloid) data**
+```{r}
+tm_brain_myeloid_data_qc_norm <- read.csv('./scRNA-seq/TabulaMuris/FACS/qc_norm/Brain_Myeloid-counts_qc_norm.csv', check.names=FALSE, row.names=1)
+
+dataset <- 'tm_brain_myeloid'
+organ <- 'brain'
+```
+
+Fit the classifiers and add the results to classifier_df
+```{r}
+classifier_df_tm_brain_myeloid <- train_classifiers(data_df = tm_brain_myeloid_data_qc_norm, dataset = dataset, organ = organ)
+classifier_df <- rbind(classifier_df, classifier_df_tm_brain_myeloid[[1]])
+```
+
+**1.2 TM Brain (Non-Myeloid) data**
+```{r}
+# Load filtered and normalized data
+tm_brain_non_myeloid_data_qc_norm <- read.csv('./scRNA-seq/TabulaMuris/FACS/qc_norm/Brain_Non-Myeloid-counts_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+dataset <- 'tm_brain_non_myeloid'
+organ <- 'brain'
+```
+
+Fit the classifiers and add the results to classifier_df
+```{r}
+classifier_df_tm_brain_non_myeloid <- train_classifiers(data_df = tm_brain_non_myeloid_data_qc_norm, dataset = dataset, organ = organ)
+classifier_df <- rbind(classifier_df, classifier_df_tm_brain_non_myeloid[[1]])
+```
+
+**1.3. Tabula Muris(FACS) Heart data.**
+```{r}
+tm_heart_data_qc_norm <- read.csv('./scRNA-seq/TabulaMuris/FACS/qc_norm/Heart-counts_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+dataset <- 'tm_heart'
+organ <- 'heart'
+```
+
+Fit the classifiers and add the results to classifier_df
+```{r}
+classifier_df_tm_heart <- train_classifiers(data_df = tm_heart_data_qc_norm, dataset = dataset, organ = organ)
+classifier_df <- rbind(classifier_df, classifier_df_tm_heart[[1]])
+```
+
+**1.4. Tabula Muris(FACS) Lung data.**
+# we don't have enough lung genes, so skipping
+```{r}
+if (FALSE) {
+tm_lung_data_qc_norm <- read.csv('./scRNA-seq/TabulaMuris/FACS/qc_norm/Lung-counts_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+dataset <- 'tm_lung'
+organ <- 'lung'
+
+classifier_df_tm_lung <- train_classifiers(data_df = tm_lung_data_qc_norm, dataset = dataset, organ = organ)
+classifier_df <- rbind(classifier_df, classifier_df_tm_lung[[1]])
+}
+```
+
+**1.5. Tabula Muris(FACS) Kidney data.**
+```{r}
+tm_kidney_data_qc_norm <- read.csv('./scRNA-seq/TabulaMuris/FACS/qc_norm/Kidney-counts_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+dataset <- 'tm_kidney'
+organ <- 'kidney'
+```
+
+Fit the classifiers and add the results to classifier_df
+```{r}
+classifier_df_tm_kidney <- train_classifiers(data_df = tm_kidney_data_qc_norm, dataset = dataset, organ = organ)
+classifier_df <- rbind(classifier_df, classifier_df_tm_kidney[[1]])
+```
+
+**2. Zhong 2018 data**
+```{r}
+zhong2018_data_qc_norm <- read.csv('./scRNA-seq/zhong2018/qc_norm/GSE104276_all_pfc_2394_UMI_count_NOERCC_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+dataset <- 'zhong_2018'
+organ <- 'brain'
+```
+
+Fit the classifiers and add the results to classifier_df
+```{r}
+classifier_df_zhong_2018 <- train_classifiers(data_df = zhong2018_data_qc_norm, dataset = dataset, organ = organ)
+classifier_df <- rbind(classifier_df, classifier_df_zhong_2018[[1]])
+```
+
+**3. La Manno 2016**
+```{r}
+lamanno2016_data_qc_norm <- read.csv('./scRNA-seq/lamanno2016/qc_norm/GSE76381_EmbryoMoleculeCounts.cef_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+dataset <- 'lamanno_2016'
+organ <- 'brain'
+```
+
+Fit the classifiers and add the results to classifier_df
+```{r}
+classifier_df_lamanno_2016 <- train_classifiers(data_df = lamanno2016_data_qc_norm, dataset = dataset, organ = organ)
+classifier_df <- rbind(classifier_df, classifier_df_lamanno_2016[[1]])
+```
+
+**4. Hodge 2019**
+```{r}
+hodge2019_data_qc_norm <- read.csv('./scRNA-seq/hodge2019/data2/qc_norm/trimmed_means_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+dataset <- 'hodge_2019'
+organ <- 'brain'
+```
+
+Fit the classifiers and add the results to classifier_df
+```{r}
+classifier_df_hodge_2019 <- train_classifiers(data_df = hodge2019_data_qc_norm, dataset = dataset, organ = organ)
+classifier_df <- rbind(classifier_df, classifier_df_hodge_2019[[1]])
+```
+
+**5. Asp 2019**
+```{r}
+asp2019_data_qc_norm <- read.csv('./scRNA-seq/asp2019/filtered_count_matrices_and_meta_tables/share_files/qc_norm/fixed_all_cells_meta_data_filtered_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+dataset <- 'asp_2019'
+organ <- 'heart'
+```
+
+Fit the classifiers and add the results to classifier_df
+```{r}
+classifier_df_asp_2019 <- train_classifiers(data_df = asp2019_data_qc_norm, dataset = dataset, organ = organ)
+classifier_df <- rbind(classifier_df, classifier_df_asp_2019[[1]])
+```
+
+**6. Nowakowski 2017**
+```{r}
+nowakowski2017_data_qc_norm <- read.csv('./scRNA-seq/nowakowski2017/qc_norm/exprMatrix_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+rownames(nowakowski2017_data_qc_norm) <- make.unique(tolower(rownames(nowakowski2017_data_qc_norm)))
+
+dataset <- 'nowakowski_2017'
+organ <- 'brain'
+```
+
+Fit the classifiers and add the results to classifier_df
+```{r}
+classifier_df_nowakowski_2017 <- train_classifiers(data_df = nowakowski2017_data_qc_norm, dataset = dataset, organ = organ)
+classifier_df <- rbind(classifier_df, classifier_df_nowakowski_2017[[1]])
+```
+
+Save to disk
+```{r}
+rownames(classifier_df)=NULL
+write.csv(classifier_df, '../results/classifiers/classifier_accuracies_6.csv', row.names = FALSE)
+```
+
+
+**ROC Curves**
+
+Function to plot the ROC curve from a ROC object
+```{r}
+plot_roc <- function(roc_obj, plot_title='ROC curve') {
+  roc_df <- data.frame(
+  TPR=rev(roc_obj$sensitivities), 
+  FPR=rev(1 - roc_obj$specificities))
+  
+  ggplot(data=roc_df, aes(x=FPR, y=TPR)) +
+    geom_point() +
+    geom_line() + 
+    geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), col='red', lty=2) +
+    xlab('1 - specificity') +
+    ylab('sensitivity') +
+    ggtitle(plot_title)
+}
+```
+
+**TM Heart Random forest**
+```{r}
+input <- make_inputData(data_df = tm_heart_data_qc_norm, organ = 'heart')
+inputData <- input[[1]]
+inputData_expr_only <- input[[2]]
+
+# split into train and test
+data_train_test <- create_train_test_data(inputData, balanced_test = BALANCED_TEST, balanced_train = BALANCED_TRAIN)
+trainingData <- data_train_test[[1]]
+testData <- data_train_test[[2]]
+
+data_train_test_exp <- create_train_test_data(inputData_expr_only, balanced_test = BALANCED_TEST, balanced_train = BALANCED_TRAIN)
+trainingData_exp <- data_train_test_exp[[1]]
+testData_exp <- data_train_test_exp[[2]]
+```
+
+Fit the classifier
+```{r}
+# fit rf on the total dataset
+tm_heart_rf <- do_rf(trainingData, testData, return_probs=TRUE, cv=FALSE)
+tm_heart_rf_exp <- do_rf(trainingData_exp, testData_exp, return_probs=TRUE, cv=FALSE)
+```
+
+Create roc objects
+```{r}
+tm_heart_rf_roc_obj <- roc(testData$gene_label, tm_heart_rf[[1]])
+tm_heart_rf_exp_roc_obj <- roc(testData_exp$gene_label, tm_heart_rf_exp[[1]])
+```
+
+Plot
+```{r}
+plot_roc(tm_heart_rf_roc_obj, plot_title = paste('ROC curve for TM Heart data; Random Forest; AUC:', as.character(round(auc(tm_heart_rf_roc_obj), 4))))
+```
+
+Plot for baseline
+```{r}
+plot_roc(tm_heart_rf_exp_roc_obj, plot_title = paste('ROC curve for TM Heart data; Random Forest (baseline); AUC:', as.character(round(auc(tm_heart_rf_exp_roc_obj), 4))))
+```
+
+**Feature Importance**
+
+```{r}
+fi_tm_heart <- data.frame(tm_heart_rf[[2]]$importance)
+fi_tm_heart$feature <- rownames(fi_tm_heart)
+fi_tm_heart <- fi_tm_heart[order(fi_tm_heart$MeanDecreaseGini, decreasing = TRUE),]
+View(fi_tm_heart)
+```
+
+
+**TM Brain Non-Myeloid**
+```{r}
+input <- make_inputData(data_df = tm_brain_non_myeloid_data_qc_norm, organ = 'heart')
+inputData <- input[[1]]
+inputData_expr_only <- input[[2]]
+
+# split into train and test
+data_train_test <- create_train_test_data(inputData, balanced_test = BALANCED_TEST, balanced_train = BALANCED_TRAIN)
+trainingData <- data_train_test[[1]]
+testData <- data_train_test[[2]]
+
+data_train_test_exp <- create_train_test_data(inputData_expr_only, balanced_test = BALANCED_TEST, balanced_train = BALANCED_TRAIN)
+trainingData_exp <- data_train_test_exp[[1]]
+testData_exp <- data_train_test_exp[[2]]
+```
+
+Fit the classifier
+```{r}
+# fit rf on the total dataset
+tm_brain_non_myeloid_rf <- do_rf(trainingData, testData, return_probs=TRUE, cv=FALSE)
+tm_brain_non_myeloid_rf_exp <- do_rf(trainingData_exp, testData_exp, return_probs=TRUE, cv=FALSE)
+```
+
+Create roc objects
+```{r}
+tm_brain_non_myeloid_rf_roc_obj <- roc(testData$gene_label, tm_brain_non_myeloid_rf[[1]])
+tm_brain_non_myeloid_rf_exp_roc_obj <- roc(testData_exp$gene_label, tm_brain_non_myeloid_rf_exp[[1]])
+```
+
+Plot
+```{r}
+plot_roc(tm_brain_non_myeloid_rf_roc_obj, plot_title = paste('ROC curve for TM Brain (Non-Myeloid) data; Random Forest; AUC:', as.character(round(auc(tm_brain_non_myeloid_rf_roc_obj), 4))))
+```
+
+Plot for baseline
+```{r}
+plot_roc(tm_brain_non_myeloid_rf_exp_roc_obj, plot_title = paste('ROC curve for TM Brain (Non-Myeloid) data; Random Forest (baseline);\nAUC:', as.character(round(auc(tm_brain_non_myeloid_rf_exp_roc_obj), 4))))
+```
+
+
+**Feature Importance**
+
+```{r}
+fi_tm_nonmyeloid <- data.frame(tm_brain_non_myeloid_rf[[2]]$importance)
+fi_tm_nonmyeloid$feature <- rownames(fi_tm_nonmyeloid)
+fi_tm_nonmyeloid <- fi_tm_nonmyeloid[order(fi_tm_nonmyeloid$MeanDecreaseGini, decreasing = TRUE),]
+View(fi_tm_nonmyeloid)
+```
