@@ -1,0 +1,57 @@
+---
+title: "Risk Genes Exploratory Analysis"
+author: "Ani Khachatryan"
+date: "3/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir='E:/Columbia/Spring2020/lab')
+```
+
+Load the DECIPHER genes.
+```{r}
+ddd_df = read.csv('./data/DDD/DDG2P_28_1_2020.csv')
+ddd_df_subset = subset(ddd_df, DDD.category == 'confirmed')
+print(dim(ddd_df)[1])
+```
+We have 2,572 risk genes in DECIPHER.
+
+```{r}
+print(dim(ddd_df_subset)[1])
+```
+
+We have 1,587 **confirmed** risk genes.
+
+Since the DECIPHER data has organ information, let's see the distribution of the implicated organs.
+```{r}
+organ_list <- unique(ddd_df_subset$organ.specificity.list)
+
+sfun <- function(myString) {
+  return(strsplit(myString, ';', fixed=TRUE)[[1]])
+}
+
+organ_list_separate <- unique(unlist(sapply(sapply(organ_list, as.character), sfun)))
+
+# now for each organ, get the number of risk genes in that organ
+
+df_organ_occur <- data.frame(matrix(nrow = length(organ_list_separate), ncol=2))
+colnames(df_organ_occur) <- c('organ', 'count')
+df_organ_occur$organ <- organ_list_separate
+
+for (organ in organ_list_separate) {
+  number_of_occur <- length(grep(organ, ddd_df_subset$organ.specificity.list))
+  df_organ_occur[df_organ_occur$organ == organ, 2] = number_of_occur
+}
+```
+
+Now let's plot a bar chart to see the distribution of risk genes by organs.
+```{r}
+library(ggplot2)
+
+ggplot(df_organ_occur, aes(x = organ, y = count)) +
+  geom_col() +
+  coord_flip()
+```
+
