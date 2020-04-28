@@ -1,0 +1,334 @@
+---
+title: "Fisher's Exact Test"
+author: "Ani Khachatryan"
+date: "3/25/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir='E:/Columbia/Spring2020/lab/data/')
+```
+
+Load the risk genes.
+```{r}
+DDD_all <- read.csv('./DDD/DDG2P_28_1_2020.csv')
+
+DDD_all$organ.specificity.list <- tolower(DDD_all$organ.specificity.list)
+DDD_all$gene.symbol <- tolower(DDD_all$gene.symbol)
+
+DDD <- subset(DDD_all, DDD.category == 'confirmed')
+```
+
+Create a T/F table of genes vs RBPs, TRUE if RBP regulates the gene
+rbp_threshold is the number of binding sites/events (?) necessary to consider the RBP a regulator of the protein
+
+```{r}
+# RBP-regualted genes
+rbp_table <- read.table('./RBP_targets/RBP_targets.txt', header=TRUE, row.names = 1)
+colnames(rbp_table) <- tolower(colnames(rbp_table))
+rownames(rbp_table) <- tolower(rownames(rbp_table))
+rbps_w_celltypes <- colnames(rbp_table)
+
+sfun <- function(MyString) {
+  return(strsplit(MyString, '.', TRUE)[[1]][2])
+}
+
+rbps <- sapply(rbps_w_celltypes, sfun)
+#rbps <- tolower(sapply(rbps_w_celltypes, sfun))
+colnames(rbp_table) <- rbps
+
+# needs to have at least rbp_threshold binding sites 
+rbp_threshold <- 10
+rbp_table_tf <- rbp_table >= rbp_threshold
+```
+
+Fisher's exact test.
+```{r}
+fishers_exact_test <- function(data_df, celltype, organ, rbp_quantile_threshold=.9, gene_quanitle_threshold=.5, consider_organ=TRUE) {
+  rownames(data_df) <- make.unique(tolower(rownames(data_df)))
+  print(paste('cell type:', celltype))
+  
+  # some preprocessing
+  # df_ct is the subset of the passed df, but only includes columns of the given celltype
+  df_ct <- data_df[, grep(celltype, names(data_df))]
+  # then we take the mean of all the cells to get the mean expression values for the celltype
+  df_ct_means <- rowMeans(df_ct)
+  # only keep top 50% expressed genes
+  quantile_gene <- quantile(df_ct_means, gene_quanitle_threshold)
+  df_ct_means_top50<- df_ct_means[df_ct_means >= quantile_gene]
+
+  # find important RBP threshhold in celltype 
+  quantile_rbp <- quantile(df_ct_means, rbp_quantile_threshold)
+  
+  # finding important RBPs in this cell type
+  # and RBP is considered important for this cell type if it's among the top 10% expressed genes
+  important_rbps_ct <- names(df_ct_means_top50[rbps][df_ct_means_top50[rbps] >= quantile_rbp])
+  important_rbps_ct <- na.omit(important_rbps_ct)
+  
+  # filtering rbp_table_tf to only keep important RBPs for this cell type
+  rbp_table_tf_important_rbps <- rbp_table_tf[, important_rbps_ct]
+
+  # separate genes into risk and non-riks
+  # remove non-confirmed DDD risk genes from non-risk
+  # RISK GENES  
+  if (consider_organ) {
+    risk_genes <- unique(DDD[grep(organ, DDD$organ.specificity.list, ignore.case = TRUE),]$gene.symbol)
+  } else {
+    risk_genes <- unique(DDD$gene.symbol)
+  }
+  
+  risk_genes <- names(df_ct_means_top50)[names(df_ct_means_top50) %in% risk_genes]
+  non_risk_genes <- names(df_ct_means_top50)[!(names(df_ct_means_top50) %in% risk_genes)]
+  non_risk_genes <- non_risk_genes[!(non_risk_genes %in% DDD_all$gene.symbol)]
+  
+  # number of top 50% expressed risk genes
+  n <- length(risk_genes)
+  
+  # number of top 50% expressed non-risk genes
+  m <- length(non_risk_genes)
+  
+  # total number of genes in consideration
+  N <- n + m
+  
+  # number of risk genes regulated by important RBPs
+  a <- sum(risk_genes %in% names(genes_regulated_by_important_rbps_ct))
+  b <- n - a
+  
+  # number of non-risk genes regulated by important RBPs
+  c <- sum(non_risk_genes %in% names(genes_regulated_by_important_rbps_ct))
+  d <- m - c
+  
+  # create the table for Fisher's extact test
+  fishers_table <- matrix(data = c(a,b,c,d), nrow = 2, ncol = 2, dimnames = list( c('RBP', 'non-RBP'), c('risk', 'non-risk')))
+  
+  print(fishers_table)
+  ft_result <- fisher.test(fishers_table)
+  
+  print(paste0('p-value: ', ft_result$p.value))
+  print(paste0('odds ratio: ', ft_result$estimate))
+  
+  return(ft_result)
+  
+}
+```
+
+Helper function: removes the extension from the cell type
+```{r}
+remove_ext <- function(mystr) {
+    return(tools::file_path_sans_ext(mystr))
+  }
+```
+
+Create a data.frame to store the results
+```{r}
+ft_df <- data.frame(matrix(ncol=4,nrow=0, dimnames=list(NULL, c('dataset', 'celltype', 'pval', 'odds_ratio'))))
+```
+
+**1. Tabula Muris (FACS) data**
+
+**1.1 TM Brain (Myeloid) data**
+```{r}
+tm_brain_myeloid_data_qc_norm <- read.csv('./scRNA-seq/TabulaMuris/FACS/qc_norm/Brain_Myeloid-counts_qc_norm.csv', check.names=FALSE, row.names=1)
+
+colnames(tm_brain_myeloid_data_qc_norm) <- unlist(lapply(colnames(tm_brain_myeloid_data_qc_norm), remove_ext))
+```
+
+Fisher's exact test
+```{r}
+dataset <- 'tm_brain_myeloid'
+celltypes <- unique(colnames(tm_brain_myeloid_data_qc_norm))
+
+for (current_celltype in celltypes) {
+  ft_result <- fishers_exact_test(data_df = tm_brain_myeloid_data_qc_norm, celltype = current_celltype, organ = 'brain')
+
+  ft_df <- rbind(ft_df, data.frame(dataset=dataset, celltype=current_celltype, pval=ft_result$p.value, odds_ratio=ft_result$estimate))
+}
+
+```
+
+
+**1.2 TM Brain (Non-Myeloid) data**
+```{r}
+# Load filtered and normalized data
+tm_brain_non_myeloid_data_qc_norm <- read.csv('./scRNA-seq/TabulaMuris/FACS/qc_norm/Brain_Non-Myeloid-counts_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+colnames(tm_brain_non_myeloid_data_qc_norm) <- unlist(lapply(colnames(tm_brain_non_myeloid_data_qc_norm), remove_ext))
+```
+
+Fisher's exact test
+```{r}
+dataset <- 'tm_brain_non_myeloid'
+celltypes <- unique(colnames(tm_brain_non_myeloid_data_qc_norm))
+
+for (current_celltype in celltypes) {
+  ft_result <- fishers_exact_test(data_df = tm_brain_non_myeloid_data_qc_norm, celltype = current_celltype, organ = 'brain')
+
+  ft_df <- rbind(ft_df, data.frame(dataset=dataset, celltype=current_celltype, pval=ft_result$p.value, odds_ratio=ft_result$estimate))
+}
+```
+
+
+**1.3. Tabula Muris(FACS) Heart data.**
+```{r}
+tm_heart_data_qc_norm <- read.csv('./scRNA-seq/TabulaMuris/FACS/qc_norm/Heart-counts_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+colnames(tm_heart_data_qc_norm) <- unlist(lapply(colnames(tm_heart_data_qc_norm), remove_ext))
+```
+
+Fisher's exact test
+```{r}
+dataset <- 'tm_heart'
+celltypes <- unique(colnames(tm_heart_data_qc_norm))
+
+for (current_celltype in celltypes) {
+  ft_result <- fishers_exact_test(data_df = tm_heart_data_qc_norm, celltype = current_celltype, organ = 'heart')
+
+  ft_df <- rbind(ft_df, data.frame(dataset=dataset, celltype=current_celltype, pval=ft_result$p.value, odds_ratio=ft_result$estimate))
+}
+```
+
+
+**1.4. Tabula Muris(FACS) Lung data.**
+```{r}
+tm_lung_data_qc_norm <- read.csv('./scRNA-seq/TabulaMuris/FACS/qc_norm/Lung-counts_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+colnames(tm_lung_data_qc_norm) <- unlist(lapply(colnames(tm_lung_data_qc_norm), remove_ext))
+```
+
+
+Fisher's exact test
+```{r}
+dataset <- 'tm_lung'
+celltypes <- unique(colnames(tm_lung_data_qc_norm))
+
+for (current_celltype in celltypes) {
+  ft_result <- fishers_exact_test(data_df = tm_lung_data_qc_norm, celltype = current_celltype, organ = 'lung')
+
+  ft_df <- rbind(ft_df, data.frame(dataset=dataset, celltype=current_celltype, pval=ft_result$p.value, odds_ratio=ft_result$estimate))
+}
+```
+
+**1.5. Tabula Muris(FACS) Kidney data.**
+```{r}
+tm_kidney_data_qc_norm <- read.csv('./scRNA-seq/TabulaMuris/FACS/qc_norm/Kidney-counts_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+colnames(tm_kidney_data_qc_norm) <- unlist(lapply(colnames(tm_kidney_data_qc_norm), remove_ext))
+```
+
+Fisher's exact test
+```{r}
+dataset <- 'tm_kidney'
+celltypes <- unique(colnames(tm_kidney_data_qc_norm))
+
+for (current_celltype in celltypes) {
+  ft_result <- fishers_exact_test(data_df = tm_kidney_data_qc_norm, celltype = current_celltype, organ = 'kidney')
+
+  ft_df <- rbind(ft_df, data.frame(dataset=dataset, celltype=current_celltype, pval=ft_result$p.value, odds_ratio=ft_result$estimate))
+}
+```
+
+**2. Zhong 2018 data**
+```{r}
+zhong2018_data_qc_norm <- read.csv('./scRNA-seq/zhong2018/qc_norm/GSE104276_all_pfc_2394_UMI_count_NOERCC_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+colnames(zhong2018_data_qc_norm) <- unlist(lapply(colnames(zhong2018_data_qc_norm), remove_ext))
+
+```
+
+Fisher's exact test
+```{r}
+dataset <- 'zhong_2018'
+celltypes <- unique(colnames(zhong2018_data_qc_norm))
+
+for (current_celltype in celltypes) {
+  ft_result <- fishers_exact_test(data_df = zhong2018_data_qc_norm, celltype = current_celltype, organ = 'brain')
+
+  ft_df <- rbind(ft_df, data.frame(dataset=dataset, celltype=current_celltype, pval=ft_result$p.value, odds_ratio=ft_result$estimate))
+}
+```
+
+
+**3. La Manno 2016**
+```{r}
+lamanno2016_data_qc_norm <- read.csv('./scRNA-seq/lamanno2016/qc_norm/GSE76381_EmbryoMoleculeCounts.cef_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+colnames(lamanno2016_data_qc_norm) <- unlist(lapply(colnames(lamanno2016_data_qc_norm), remove_ext))
+```
+
+Fisher's exact test
+```{r}
+dataset <- 'lamanno_2016'
+celltypes <- unique(colnames(lamanno2016_data_qc_norm))
+
+for (current_celltype in celltypes) {
+  ft_result <- fishers_exact_test(data_df = lamanno2016_data_qc_norm, celltype = current_celltype, organ = 'brain')
+
+  ft_df <- rbind(ft_df, data.frame(dataset=dataset, celltype=current_celltype, pval=ft_result$p.value, odds_ratio=ft_result$estimate))
+}
+```
+
+**4. Hodge 2019**
+```{r}
+hodge2019_data_qc_norm <- read.csv('./scRNA-seq/hodge2019/data2/qc_norm/trimmed_means_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+colnames(hodge2019_data_qc_norm) <- unlist(lapply(colnames(hodge2019_data_qc_norm), remove_ext))
+```
+
+Fisher's exact test
+```{r}
+dataset <- 'hodge_2019'
+celltypes <- unique(colnames(hodge2019_data_qc_norm))
+
+for (current_celltype in celltypes) {
+  ft_result <- fishers_exact_test(data_df = hodge2019_data_qc_norm, celltype = current_celltype, organ = 'brain')
+
+  ft_df <- rbind(ft_df, data.frame(dataset=dataset, celltype=current_celltype, pval=ft_result$p.value, odds_ratio=ft_result$estimate))
+}
+```
+
+**5. Asp 2019**
+```{r}
+asp2019_data_qc_norm <- read.csv('./scRNA-seq/asp2019/filtered_count_matrices_and_meta_tables/share_files/qc_norm/fixed_all_cells_meta_data_filtered_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+colnames(asp2019_data_qc_norm) <- unlist(lapply(colnames(asp2019_data_qc_norm), remove_ext))
+```
+
+Fisher's exact test
+```{r}
+dataset <- 'asp_2019'
+celltypes <- unique(colnames(asp2019_data_qc_norm))
+
+for (current_celltype in celltypes) {
+  ft_result <- fishers_exact_test(data_df = asp2019_data_qc_norm, celltype = current_celltype, organ = 'heart')
+
+  ft_df <- rbind(ft_df, data.frame(dataset=dataset, celltype=current_celltype, pval=ft_result$p.value, odds_ratio=ft_result$estimate))
+}
+```
+
+
+**6. Nowakowski 2017**
+```{r}
+nowakowski2017_data_qc_norm <- read.csv('./scRNA-seq/nowakowski2017/qc_norm/exprMatrix_qc_norm.csv', check.names=FALSE, row.names = 1)
+
+colnames(nowakowski2017_data_qc_norm) <- unlist(lapply(colnames(nowakowski2017_data_qc_norm), remove_ext))
+```
+
+Fisher's exact test
+```{r}
+dataset <- 'nowakowski_2017'
+celltypes <- unique(colnames(nowakowski2017_data_qc_norm))
+
+for (current_celltype in celltypes) {
+  ft_result <- fishers_exact_test(data_df = nowakowski2017_data_qc_norm, celltype = current_celltype, organ = 'brain')
+
+  ft_df <- rbind(ft_df, data.frame(dataset=dataset, celltype=current_celltype, pval=ft_result$p.value, odds_ratio=ft_result$estimate))
+}
+```
+
+
+```{r}
+rownames(ft_df)=NULL
+write.csv(ft_df, '../results/fishers_exact_test/fishers_test.csv', row.names = FALSE)
+```
+
