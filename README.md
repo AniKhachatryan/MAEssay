@@ -1,2 +1,2 @@
 # MAEssay
-Code of the analyses performed for my Columbia Biomedical Informatics MA Essay.
+Code and reports of the analyses performed for my Columbia University Biomedical Informatics MA Essay.
